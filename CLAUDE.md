@@ -4,7 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-V-ADASM (Vision-Adaptive Dimensionality-Aligned Subspace Merging) is a training-free framework for merging large multimodal (text+vision) LLMs into compact text-only LLMs to create lightweight Vision-Language Models (VLMs). The system uses offline operations (SVD, permutations, evolutionary tuning) to inject visual reasoning from large donor models (e.g., LLaVA-Next 34B) into small base models (e.g., Llama-3-7B) without fine-tuning or distillation.
+V-ADASM (Vision-Adaptive Dimensionality-Aligned Subspace Merging) is a training-free framework for merging large multimodal (text+vision) LLMs into compact text-only LLMs to create lightweight Vision-Language Models (VLMs). The system uses offline operations (SVD, permutations, evolutionary tuning) to:
+
+1. **Inject vision capabilities** from large donor models (e.g., LLaVA-Next 34B) into small base models (e.g., Llama-3-7B)
+2. **Transfer language knowledge** from the large model's superior text understanding into the small model
+
+This creates a small model that has BOTH vision capabilities AND improved language/reasoning abilities - all without any training or fine-tuning!
 
 ## Build & Development Commands
 
@@ -67,23 +72,25 @@ python scripts/eval_vlm.py --model ./vadasm-7b --tasks vqav2 okvqa mmlu gsm8k --
 
 ## Architecture Overview
 
-### Core Pipeline (5-Step V-ADASM Process)
+### Core Pipeline (Enhanced 6-Step V-ADASM Process)
 
-The merger follows a 5-step pipeline implemented in `vadasm/merger.py`:
+The merger follows an enhanced 6-step pipeline implemented in `vadasm/merger.py`:
 
-1. **Vision Subspace Extraction** (`VisionExtractor`, `_extract_vision_subspaces`): Extracts vision capabilities from large donor model using SVD decomposition on the multimodal projector, reducing to principal components capturing 95% variance.
+1. **Vision Subspace Extraction** (`_extract_vision_subspaces`): Extracts vision capabilities from large donor model using SVD decomposition on the multimodal projector, reducing to principal components capturing 95% variance.
 
-2. **Cross-Modality Alignment** (`CrossModalAligner`, `_cross_modality_alignment`): Aligns text and vision representations using Hungarian algorithm to find optimal neuron permutations based on cosine similarity. Aligns the first 20% of layers where vision-text crossover occurs.
+2. **Language Knowledge Extraction** (`_extract_language_knowledge`): NEW! Extracts language/reasoning knowledge from the large model by computing parameter deltas (large_weights - small_weights) for all attention and MLP layers. This transfers the superior language understanding from the big model to the small model.
 
-3. **Subspace Fusion & Injection** (`SubspaceFuser`, `_subspace_fusion_injection`): Injects vision subspaces into small model using TIES (resolves sign conflicts, keeps larger magnitudes) and DARE (drops 30% of small magnitude deltas, rescales survivors).
+3. **Cross-Modality Alignment** (`_cross_modality_alignment`): Aligns text and vision representations using Hungarian algorithm to find optimal neuron permutations based on cosine similarity. Aligns the first 20% of layers where vision-text crossover occurs.
 
-4. **Evolutionary Hyperparameter Optimization** (`EvolutionaryTuner`, `_evolutionary_tuning`): Uses DEAP genetic algorithm to optimize fusion_beta and ties_drop_rate parameters on validation data (30 population, 15 generations).
+4. **Dual Fusion & Injection** (`_subspace_fusion_injection`): Injects BOTH vision subspaces AND language knowledge into small model using TIES (resolves sign conflicts, keeps larger magnitudes) and DARE (drops 30% of small magnitude deltas, rescales survivors). This creates a small model with vision capabilities AND better language understanding.
 
-5. **Validation & Deployment** (`_validate_merge`): Final parameter counting, vision/text scoring, and model export with vision_projector module attached.
+5. **Evolutionary Hyperparameter Optimization** (`_evolutionary_tuning`): Uses DEAP genetic algorithm to optimize fusion_beta and ties_drop_rate parameters on validation data (30 population, 15 generations).
+
+6. **Validation & Deployment** (`_validate_merge`): Final parameter counting, vision/text scoring, and model export with vision_projector module attached.
 
 ### Module Responsibilities
 
-- **`vadasm/merger.py`**: Main `VADASMMerger` class orchestrating the 5-step pipeline. Contains `ModelConfig` and `MergeConfig` dataclasses for configuration.
+- **`vadasm/merger.py`**: Main `VADASMMerger` class orchestrating the 6-step pipeline. Contains `ModelConfig` and `MergeConfig` dataclasses for configuration. Now includes language knowledge transfer alongside vision injection.
 
 - **`vadasm/vision.py`**: `VisionExtractor` class handles vision tower and projector extraction, SVD decomposition, and cross-modal activation generation.
 
@@ -107,6 +114,8 @@ The architecture handles heterogeneous Dense ↔ MoE merges:
 - **`projector_svd_rank`** (0.95): Variance threshold for SVD - controls how much vision information is retained
 - **`alignment_layer_ratio`** (0.2): Fraction of layers to align from start - where vision-text crossover happens
 - **`fusion_beta`** (0.3): Weight for vision deltas during fusion - higher = more vision influence
+- **`language_transfer_enabled`** (True): Enable/disable language knowledge transfer from large model
+- **`language_transfer_beta`** (0.3): Weight for language knowledge deltas - controls how much language knowledge from big model is incorporated
 - **`ties_drop_rate`** (0.3): Fraction of deltas to drop in TIES - controls sparsity
 - **`evo_generations`** (15): Number of evolutionary optimization rounds
 
@@ -151,10 +160,19 @@ V-ADASM supports **any** Hugging Face model architecture through automatic detec
 - Uses cosine similarity cost matrix with Hungarian algorithm for optimal assignment
 
 ### TIES + DARE Fusion Logic
+
+**For Vision Deltas:**
 1. Compute delta: `beta * (vision_weights - base_weights)`
 2. TIES resolves conflicts: keep delta where it agrees with base or has larger magnitude
 3. DARE drops deltas below quantile threshold and rescales survivors to preserve total magnitude
 4. Applied to MLP gate_proj or attention q_proj weights depending on layer structure
+
+**For Language Knowledge Deltas (NEW):**
+1. Compute delta: `large_weights - small_weights` for each layer parameter (q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj)
+2. TIES resolves conflicts: keep delta where signs agree OR large model magnitude is stronger
+3. DARE drops small magnitude deltas to prevent catastrophic forgetting
+4. Scale by `language_transfer_beta` (default 0.3) to control knowledge incorporation
+5. Applied to ALL matched attention and MLP parameters across all layers
 
 ## Testing Strategy
 

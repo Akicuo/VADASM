@@ -39,29 +39,33 @@ class MergeConfig:
     """V-ADASM merge configuration"""
     # Vision subspace extraction
     projector_svd_rank: float = 0.95  # Keep 95% variance
-    
+
     # Alignment
     alignment_layer_ratio: float = 0.2  # Align first 20% of layers
     cos_sim_threshold: float = 0.8
-    
+
     # Fusion
-    fusion_beta: float = 0.3  # Weight for vision deltas
+    fusion_beta: float = 0.3  # Weight for vision deltas AND language knowledge transfer
     ties_drop_rate: float = 0.3  # Drop 30% of small magnitude deltas
     dare_rescale_factor: float = 1.0 / 0.7  # Rescale survivors
-    
+
+    # Language knowledge transfer
+    language_transfer_enabled: bool = True  # Enable transferring language knowledge from large model
+    language_transfer_beta: float = 0.3  # Weight for language knowledge (same as fusion_beta by default)
+
     # Evolutionary optimization
     evo_population_size: int = 30
     evo_generations: int = 15
     evo_mutation_rate: float = 0.1
-    
+
     # MoE specific
     moe_top_k: int = 2  # Aggregate top-k experts
     moe_aggregate_method: str = "norm_avg"  # norm_avg or uniform
-    
+
     # Hardware
     torch_dtype: torch.dtype = torch.bfloat16
     device: str = "auto"
-    
+
     # Validation
     val_text_count: int = 500
     val_vision_count: int = 500
@@ -80,43 +84,46 @@ class VADASMMerger:
             
         logger.info(f"Initialized V-ADASM merger on device: {self.device}")
     
-    def merge_models(self, small_config: ModelConfig, large_config: ModelConfig, 
+    def merge_models(self, small_config: ModelConfig, large_config: ModelConfig,
                     val_data: Optional[Dict] = None) -> nn.Module:
         """
-        Main V-ADASM pipeline: 5 steps to fuse vision into small model
-        
+        Main V-ADASM pipeline: Enhanced 6-step merge for vision + language knowledge transfer
+
         Args:
             small_config: Small base model (recipient)
-            large_config: Large multimodal donor (source) 
+            large_config: Large multimodal donor (source)
             val_data: Optional validation data for evolutionary tuning
-            
+
         Returns:
-            Merged VLM model with small's architecture + vision capabilities
+            Merged VLM model with small's architecture + vision capabilities + large model knowledge
         """
-        logger.info("Starting V-ADASM merge pipeline...")
-        
+        logger.info("Starting Enhanced V-ADASM merge pipeline (vision + language knowledge)...")
+
         # Load models
         small_model = self._load_model(small_config)
         large_model = self._load_model(large_config)
-        
+
         # Step 1: Extract vision subspaces from donor
         vis_subspaces, cross_acts = self._extract_vision_subspaces(large_model, large_config)
-        
-        # Step 2: Align cross-modal representations
-        align_maps = self._cross_modality_alignment(small_model, large_model, 
+
+        # Step 2: Extract language knowledge deltas from large model
+        lang_deltas = self._extract_language_knowledge(small_model, large_model, small_config, large_config)
+
+        # Step 3: Align cross-modal representations
+        align_maps = self._cross_modality_alignment(small_model, large_model,
                                                   small_config, large_config, cross_acts)
-        
-        # Step 3: Fuse subspaces into small model
-        merged_model = self._subspace_fusion_injection(small_model, vis_subspaces, align_maps)
-        
-        # Step 4: Evolutionary hyperparameter optimization
+
+        # Step 4: Fuse both vision subspaces AND language knowledge into small model
+        merged_model = self._subspace_fusion_injection(small_model, vis_subspaces, align_maps, lang_deltas)
+
+        # Step 5: Evolutionary hyperparameter optimization
         if val_data:
             merged_model = self._evolutionary_tuning(merged_model, val_data, small_config, large_config)
-        
-        # Step 5: Final validation and cleanup
+
+        # Step 6: Final validation and cleanup
         final_stats = self._validate_merge(merged_model, val_data)
         logger.info(f"Merge completed. Stats: {final_stats}")
-        
+
         return merged_model
     
     def _load_model(self, config: ModelConfig) -> nn.Module:
@@ -130,35 +137,102 @@ class VADASMMerger:
             model = None
             processor = None
 
-            # Try 1: Specific multimodal classes
             try:
-                from transformers import (
-                    LlavaForConditionalGeneration,
-                    Qwen2VLForConditionalGeneration,
-                    AutoModelForVision2Seq,
-                    AutoProcessor
-                )
+                from transformers import AutoProcessor
 
-                # Try known multimodal model classes
-                model_classes = [
-                    LlavaForConditionalGeneration,
-                    Qwen2VLForConditionalGeneration,
-                    AutoModelForVision2Seq,
-                ]
+                # Import all known VLM classes (gracefully handle missing ones)
+                vlm_classes = []
 
-                for model_class in model_classes:
+                # LLaVA family
+                try:
+                    from transformers import LlavaForConditionalGeneration
+                    vlm_classes.append(("LlavaForConditionalGeneration", LlavaForConditionalGeneration))
+                except ImportError:
+                    pass
+
+                try:
+                    from transformers import LlavaNextForConditionalGeneration
+                    vlm_classes.append(("LlavaNextForConditionalGeneration", LlavaNextForConditionalGeneration))
+                except ImportError:
+                    pass
+
+                # Qwen-VL family (Qwen2VL, Qwen3VL)
+                try:
+                    from transformers import Qwen2VLForConditionalGeneration
+                    vlm_classes.append(("Qwen2VLForConditionalGeneration", Qwen2VLForConditionalGeneration))
+                except ImportError:
+                    pass
+
+                # Note: Qwen3VL might use same class as Qwen2VL or AutoModel
+                # MiniCPM-V family
+                try:
+                    from transformers import MiniCPMV
+                    vlm_classes.append(("MiniCPMV", MiniCPMV))
+                except ImportError:
+                    pass
+
+                # CogVLM family
+                try:
+                    from transformers import CogVLMForCausalLM
+                    vlm_classes.append(("CogVLMForCausalLM", CogVLMForCausalLM))
+                except ImportError:
+                    pass
+
+                # InternVL family
+                try:
+                    from transformers import InternVLChatModel
+                    vlm_classes.append(("InternVLChatModel", InternVLChatModel))
+                except ImportError:
+                    pass
+
+                # Generic VLM classes
+                try:
+                    from transformers import AutoModelForVision2Seq
+                    vlm_classes.append(("AutoModelForVision2Seq", AutoModelForVision2Seq))
+                except ImportError:
+                    pass
+
+                # Paligemma, Idefics, etc.
+                try:
+                    from transformers import PaliGemmaForConditionalGeneration
+                    vlm_classes.append(("PaliGemmaForConditionalGeneration", PaliGemmaForConditionalGeneration))
+                except ImportError:
+                    pass
+
+                try:
+                    from transformers import Idefics2ForConditionalGeneration
+                    vlm_classes.append(("Idefics2ForConditionalGeneration", Idefics2ForConditionalGeneration))
+                except ImportError:
+                    pass
+
+                # Try each model class
+                last_error = None
+                for class_name, model_class in vlm_classes:
                     try:
+                        logger.info(f"Trying to load as {class_name}...")
                         model = model_class.from_pretrained(config.name_or_path, **kwargs)
-                        logger.info(f"Loaded as {model_class.__name__}")
+                        logger.info(f"✓ Successfully loaded as {class_name}")
                         break
-                    except:
+                    except Exception as e:
+                        last_error = e
+                        logger.debug(f"Failed to load as {class_name}: {str(e)[:100]}")
                         continue
 
                 if model is None:
-                    # Try AutoModel as fallback
-                    model = AutoModel.from_pretrained(config.name_or_path, **kwargs)
-                    logger.info("Loaded with AutoModel")
+                    # Final fallback: AutoModel with trust_remote_code
+                    logger.info("Trying AutoModel as final fallback...")
+                    try:
+                        model = AutoModel.from_pretrained(config.name_or_path, **kwargs)
+                        logger.info("✓ Successfully loaded with AutoModel")
+                    except Exception as e:
+                        logger.error(f"All loading attempts failed. Last error: {e}")
+                        raise RuntimeError(
+                            f"Could not load multimodal model {config.name_or_path}. "
+                            f"Tried {len(vlm_classes)} model classes and AutoModel. "
+                            f"Last error: {str(last_error)[:200]}"
+                        )
 
+                # Load processor
                 processor = AutoProcessor.from_pretrained(config.name_or_path, trust_remote_code=True)
                 return {"model": model, "processor": processor}
 
@@ -276,7 +350,122 @@ class VADASMMerger:
         }
 
         return vis_subspaces, cross_acts.to(self.device)
-    
+
+    def _extract_language_knowledge(self, small_model, large_model,
+                                   small_config: ModelConfig, large_config: ModelConfig) -> Dict:
+        """
+        Step 2: Extract language knowledge deltas from large model's text capabilities
+
+        This transfers the superior language understanding from the large model to the small model
+        by computing parameter deltas for each layer.
+
+        Returns:
+            lang_deltas: Dict mapping layer_idx -> {param_name: delta_tensor}
+        """
+        if not self.config.language_transfer_enabled:
+            logger.info("Step 2: Language knowledge transfer disabled, skipping...")
+            return {}
+
+        logger.info("Step 2: Extracting language knowledge from large model...")
+
+        small_m = small_model["model"]
+        large_m = large_model["model"]
+
+        # Extract the language model from multimodal wrapper if needed
+        if hasattr(large_m, 'language_model'):
+            large_m = large_m.language_model
+        elif hasattr(large_m, 'model') and hasattr(large_m.model, 'layers'):
+            large_m = large_m.model
+
+        # Get small model layers
+        if hasattr(small_m, 'model') and hasattr(small_m.model, 'layers'):
+            small_m = small_m.model
+        elif hasattr(small_m, 'transformer') and hasattr(small_m.transformer, 'h'):
+            small_m.layers = small_m.transformer.h
+
+        if not hasattr(small_m, 'layers') or not hasattr(large_m, 'layers'):
+            logger.warning("Could not find layers in models, skipping language knowledge extraction")
+            return {}
+
+        lang_deltas = {}
+
+        # Extract deltas for each layer (align by layer index)
+        num_layers = min(len(small_m.layers), len(large_m.layers))
+        logger.info(f"Extracting language deltas for {num_layers} layers...")
+
+        for layer_idx in range(num_layers):
+            small_layer = small_m.layers[layer_idx]
+            large_layer = large_m.layers[layer_idx]
+
+            layer_deltas = {}
+
+            # Extract deltas from attention weights
+            if hasattr(small_layer, 'self_attn') and hasattr(large_layer, 'self_attn'):
+                small_attn = small_layer.self_attn
+                large_attn = large_layer.self_attn
+
+                # Q, K, V projection deltas
+                for proj_name in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
+                    if hasattr(small_attn, proj_name) and hasattr(large_attn, proj_name):
+                        small_weight = getattr(small_attn, proj_name).weight.data
+                        large_weight = getattr(large_attn, proj_name).weight.data
+
+                        # Compute delta (with dimension handling)
+                        delta = self._compute_weight_delta(small_weight, large_weight)
+                        if delta is not None:
+                            layer_deltas[f'self_attn.{proj_name}'] = delta
+
+            # Extract deltas from MLP/FFN weights
+            if hasattr(small_layer, 'mlp') and hasattr(large_layer, 'mlp'):
+                small_mlp = small_layer.mlp
+                large_mlp = large_layer.mlp
+
+                # Gate, up, down projections (LLaMA-style)
+                for proj_name in ['gate_proj', 'up_proj', 'down_proj', 'fc_in', 'fc_out']:
+                    if hasattr(small_mlp, proj_name) and hasattr(large_mlp, proj_name):
+                        small_weight = getattr(small_mlp, proj_name).weight.data
+                        large_weight = getattr(large_mlp, proj_name).weight.data
+
+                        delta = self._compute_weight_delta(small_weight, large_weight)
+                        if delta is not None:
+                            layer_deltas[f'mlp.{proj_name}'] = delta
+
+            if layer_deltas:
+                lang_deltas[layer_idx] = layer_deltas
+                logger.debug(f"Layer {layer_idx}: extracted {len(layer_deltas)} parameter deltas")
+
+        logger.info(f"✓ Extracted language knowledge from {len(lang_deltas)} layers")
+        return lang_deltas
+
+    def _compute_weight_delta(self, small_weight: torch.Tensor, large_weight: torch.Tensor) -> Optional[torch.Tensor]:
+        """
+        Compute parameter delta between large and small model weights
+        Handles dimension mismatches via projection/slicing
+        """
+        # Handle dimension mismatch
+        if small_weight.shape != large_weight.shape:
+            # If shapes completely incompatible, skip
+            if small_weight.dim() != large_weight.dim():
+                return None
+
+            # Slice or pad to match small model dimensions
+            delta = torch.zeros_like(small_weight)
+
+            # Determine overlap region
+            min_dim0 = min(small_weight.shape[0], large_weight.shape[0])
+            min_dim1 = min(small_weight.shape[1], large_weight.shape[1])
+
+            # Compute delta for overlapping region
+            small_slice = small_weight[:min_dim0, :min_dim1]
+            large_slice = large_weight[:min_dim0, :min_dim1]
+
+            delta[:min_dim0, :min_dim1] = large_slice - small_slice
+            return delta.detach().cpu()
+
+        # Same shape - direct delta
+        delta = large_weight - small_weight
+        return delta.detach().cpu()
+
     def _cross_modality_alignment(self, small_model, large_model, small_config: ModelConfig,
                                 large_config: ModelConfig, cross_acts: torch.Tensor) -> Dict:
         """
@@ -412,11 +601,16 @@ class VADASMMerger:
         return torch.stack(expert_outputs, dim=0).mean(dim=0)
     
     def _subspace_fusion_injection(self, small_model, vis_subspaces: Dict,
-                                 alignment_maps: Dict) -> nn.Module:
+                                 alignment_maps: Dict, lang_deltas: Dict) -> nn.Module:
         """
-        Step 3: Inject vision subspaces into small model using TIES and DARE
+        Step 4: Inject both vision subspaces AND language knowledge into small model using TIES and DARE
+
+        This method now does:
+        1. Applies permutations from alignment
+        2. Injects vision capabilities via TIES+DARE fusion
+        3. Transfers language knowledge from large model via TIES+DARE on deltas
         """
-        logger.info("Step 3: Subspace fusion and injection...")
+        logger.info("Step 4: Subspace fusion and injection (vision + language)...")
 
         model = small_model["model"]
         state_dict = model.state_dict()
@@ -461,6 +655,21 @@ class VADASMMerger:
 
             # Fuse vision deltas using TIES (resolve sign conflicts) and DARE (sparsity)
             self._ties_dare_fusion(layer, W_vis, layer_idx)
+
+        # Inject language knowledge from large model
+        logger.info("Injecting language knowledge deltas...")
+        num_lang_injections = 0
+        for layer_idx in range(len(layers)):
+            if layer_idx in lang_deltas:
+                layer = layers[layer_idx]
+                layer_deltas = lang_deltas[layer_idx]
+
+                # Apply each parameter delta using TIES+DARE
+                for param_path, delta in layer_deltas.items():
+                    self._apply_language_delta(layer, param_path, delta)
+                    num_lang_injections += 1
+
+        logger.info(f"✓ Applied {num_lang_injections} language knowledge deltas across {len(lang_deltas)} layers")
 
         # Inject vision projector as prefix for multimodal inference
         self._inject_vision_projector(model, vis_subspaces)
@@ -523,7 +732,85 @@ class VADASMMerger:
 
         # Apply fusion
         target_weights.add_(final_delta)
-    
+
+    def _apply_language_delta(self, layer, param_path: str, delta: torch.Tensor):
+        """
+        Apply language knowledge delta to layer parameter using TIES+DARE
+
+        Args:
+            layer: The layer to modify
+            param_path: Path to parameter (e.g., 'self_attn.q_proj', 'mlp.gate_proj')
+            delta: The parameter delta to apply (already computed as large - small)
+        """
+        # Parse parameter path
+        parts = param_path.split('.')
+        target_obj = layer
+
+        # Navigate to the target parameter
+        for part in parts[:-1]:
+            if not hasattr(target_obj, part):
+                return  # Skip if path doesn't exist
+            target_obj = getattr(target_obj, part)
+
+        param_name = parts[-1]
+        if not hasattr(target_obj, param_name):
+            return
+
+        target_param = getattr(target_obj, param_name)
+        if not hasattr(target_param, 'weight'):
+            return
+
+        target_weights = target_param.weight.data
+        device = target_weights.device
+        dtype = target_weights.dtype
+
+        # Move delta to correct device and dtype
+        delta = delta.to(device).to(dtype)
+
+        # Ensure shapes match (should already be aligned from _compute_weight_delta)
+        if delta.shape != target_weights.shape:
+            logger.warning(f"Shape mismatch for {param_path}: delta={delta.shape}, target={target_weights.shape}")
+            return
+
+        # Apply TIES: Resolve sign conflicts
+        # Here delta represents knowledge from large model
+        # We want to incorporate it, but resolve conflicts with current weights
+        current_sign = torch.sign(target_weights)
+        delta_sign = torch.sign(delta)
+
+        # Conflict mask: where signs disagree
+        conflict_mask = (current_sign != delta_sign) & (current_sign != 0) & (delta_sign != 0)
+
+        # Keep delta where:
+        # 1. No conflict (signs agree)
+        # 2. Delta has larger magnitude (large model's knowledge is stronger)
+        ties_mask = ~conflict_mask | (torch.abs(delta) >= torch.abs(target_weights))
+        ties_delta = torch.where(ties_mask, delta, torch.zeros_like(delta))
+
+        # Apply DARE: Drop small magnitude deltas and rescale
+        # This prevents catastrophic forgetting by only keeping significant changes
+        abs_delta = torch.abs(ties_delta).float()
+        if abs_delta.numel() > 0 and abs_delta.max() > 0:
+            threshold = torch.quantile(abs_delta, self.config.ties_drop_rate)
+            dare_mask = torch.abs(ties_delta) > threshold
+
+            # Count kept elements and rescale
+            kept_elements = dare_mask.sum().item()
+            if kept_elements > 0:
+                rescale_factor = ties_delta.numel() / kept_elements
+                final_delta = torch.where(dare_mask,
+                                        ties_delta * self.config.dare_rescale_factor,
+                                        torch.zeros_like(ties_delta))
+            else:
+                final_delta = torch.zeros_like(ties_delta)
+        else:
+            final_delta = torch.zeros_like(ties_delta)
+
+        # Apply language knowledge delta with scaling
+        # Use language_transfer_beta to control how much large model knowledge to incorporate
+        scaled_delta = self.config.language_transfer_beta * final_delta
+        target_weights.add_(scaled_delta)
+
     def _inject_vision_projector(self, model, vis_subspaces: Dict):
         """Inject vision projector for multimodal inference"""
         
