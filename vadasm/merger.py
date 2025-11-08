@@ -383,65 +383,110 @@ class VADASMMerger:
         # Simple average - in practice weight by router probabilities  
         return torch.stack(expert_outputs, dim=0).mean(dim=0)
     
-    def _subspace_fusion_injection(self, small_model, vis_subspaces: Dict, 
+    def _subspace_fusion_injection(self, small_model, vis_subspaces: Dict,
                                  alignment_maps: Dict) -> nn.Module:
         """
         Step 3: Inject vision subspaces into small model using TIES and DARE
         """
         logger.info("Step 3: Subspace fusion and injection...")
-        
+
         model = small_model["model"]
         state_dict = model.state_dict()
-        
+
+        # Get the actual model layers
+        if hasattr(model, 'layers'):
+            layers = model.layers
+        elif hasattr(model, 'model') and hasattr(model.model, 'layers'):
+            layers = model.model.layers
+        elif hasattr(model, 'transformer') and hasattr(model.transformer, 'h'):
+            layers = model.transformer.h
+        else:
+            logger.warning("Could not find model layers, skipping fusion")
+            # Still inject vision projector
+            self._inject_vision_projector(model, vis_subspaces)
+            return model
+
         # Get vision deltas from reduced projector
         W_vis = vis_subspaces["projector_reduced"]
-        
+
         # For each layer in alignment maps
         for layer_idx, perm in alignment_maps.items():
-            layer = model.layers[layer_idx]
-            
-            # Apply permutation to align representations
-            if hasattr(layer, 'self_attn'):
-                # Permute attention weights
-                layer.self_attn.q_proj.weight.data = layer.self_attn.q_proj.weight.data[:, perm]
-                layer.self_attn.k_proj.weight.data = layer.self_attn.k_proj.weight.data[:, perm]
-                layer.self_attn.v_proj.weight.data = layer.self_attn.v_proj.weight.data[perm, :]
-                
-            # Fuse vision deltas using TIES (resolve sign conflicts) and DARE (sparsity)  
+            if layer_idx >= len(layers):
+                logger.warning(f"Layer {layer_idx} out of range, skipping")
+                continue
+
+            layer = layers[layer_idx]
+
+            # Apply permutation to align representations (if perm is valid)
+            if hasattr(layer, 'self_attn') and len(perm) > 0:
+                try:
+                    # Permute attention weights
+                    layer.self_attn.q_proj.weight.data = layer.self_attn.q_proj.weight.data[:, perm]
+                    layer.self_attn.k_proj.weight.data = layer.self_attn.k_proj.weight.data[:, perm]
+                    layer.self_attn.v_proj.weight.data = layer.self_attn.v_proj.weight.data[perm, :]
+                except Exception as e:
+                    logger.warning(f"Could not permute layer {layer_idx}: {e}")
+
+            # Fuse vision deltas using TIES (resolve sign conflicts) and DARE (sparsity)
             self._ties_dare_fusion(layer, W_vis, layer_idx)
-        
+
         # Inject vision projector as prefix for multimodal inference
         self._inject_vision_projector(model, vis_subspaces)
-        
+
         return model
     
     def _ties_dare_fusion(self, layer, W_vis: torch.Tensor, layer_idx: int):
         """Apply TIES (resolve conflicts) and DARE (add sparsity) to fusion"""
-        
+
         # Get layer weights to modify
-        if hasattr(layer, 'mlp'):
+        target_weights = None
+        if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'gate_proj'):
             target_weights = layer.mlp.gate_proj.weight.data
+        elif hasattr(layer, 'mlp') and hasattr(layer.mlp, 'fc_in'):
+            target_weights = layer.mlp.fc_in.weight.data
+        elif hasattr(layer, 'mlp') and hasattr(layer.mlp, 'up_proj'):
+            target_weights = layer.mlp.up_proj.weight.data
+
+        if target_weights is None:
+            return  # Skip if no suitable MLP weights found
+
+        # Ensure W_vis is on the same device and dtype
+        W_vis = W_vis.to(target_weights.device).to(target_weights.dtype)
+
+        # Handle dimension mismatch by projecting/slicing
+        if W_vis.shape[0] < target_weights.shape[0] or W_vis.shape[1] < target_weights.shape[1]:
+            # Pad W_vis if it's smaller
+            pad_0 = max(0, target_weights.shape[0] - W_vis.shape[0])
+            pad_1 = max(0, target_weights.shape[1] - W_vis.shape[1])
+            if pad_0 > 0 or pad_1 > 0:
+                W_vis_padded = torch.zeros(
+                    target_weights.shape[0], target_weights.shape[1],
+                    device=W_vis.device, dtype=W_vis.dtype
+                )
+                W_vis_padded[:W_vis.shape[0], :W_vis.shape[1]] = W_vis
+                W_vis = W_vis_padded
         else:
-            return  # Skip if no MLP
-            
+            # Slice W_vis if it's larger
+            W_vis = W_vis[:target_weights.shape[0], :target_weights.shape[1]]
+
         # Compute vision delta (simplified projection)
         beta = self.config.fusion_beta
-        vis_delta = beta * (W_vis[:target_weights.shape[0], :target_weights.shape[1]] - target_weights)
-        
+        vis_delta = beta * (W_vis - target_weights)
+
         # TIES: Resolve sign conflicts by keeping larger magnitude
         current_sign = torch.sign(target_weights)
         delta_sign = torch.sign(vis_delta)
         conflict_mask = (current_sign != delta_sign) & (current_sign != 0)
-        
+
         # Keep delta where it agrees or is larger magnitude
         ties_mask = conflict_mask & (torch.abs(vis_delta) >= torch.abs(target_weights))
         final_delta = torch.where(ties_mask, vis_delta, torch.zeros_like(vis_delta))
-        
+
         # DARE: Drop small deltas and rescale survivors
         drop_mask = torch.abs(final_delta) < torch.quantile(torch.abs(final_delta), self.config.ties_drop_rate)
-        final_delta = torch.where(drop_mask, torch.zeros_like(final_delta), 
+        final_delta = torch.where(drop_mask, torch.zeros_like(final_delta),
                                 final_delta * self.config.dare_rescale_factor)
-        
+
         # Apply fusion
         target_weights.add_(final_delta)
     
