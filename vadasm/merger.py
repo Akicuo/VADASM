@@ -446,21 +446,58 @@ class VADASMMerger:
         if small_weight.shape != large_weight.shape:
             # If shapes completely incompatible, skip
             if small_weight.dim() != large_weight.dim():
+                logger.debug(f"Incompatible dimensions: small {small_weight.shape}, large {large_weight.shape}")
                 return None
 
-            # Slice or pad to match small model dimensions
-            delta = torch.zeros_like(small_weight)
+            # Check if shapes are too different to be meaningful
+            # For example, if one dimension differs by more than 3x, skip
+            shape_ratio_0 = max(small_weight.shape[0], large_weight.shape[0]) / min(small_weight.shape[0], large_weight.shape[0])
+            shape_ratio_1 = max(small_weight.shape[1], large_weight.shape[1]) / min(small_weight.shape[1], large_weight.shape[1])
 
-            # Determine overlap region
-            min_dim0 = min(small_weight.shape[0], large_weight.shape[0])
-            min_dim1 = min(small_weight.shape[1], large_weight.shape[1])
+            if shape_ratio_0 > 3.0 or shape_ratio_1 > 3.0:
+                logger.debug(f"Shape ratio too large: {shape_ratio_0:.1f}x{shape_ratio_1:.1f}, skipping delta")
+                return None
 
-            # Compute delta for overlapping region
-            small_slice = small_weight[:min_dim0, :min_dim1]
-            large_slice = large_weight[:min_dim0, :min_dim1]
+            # Try projection for dimension mismatch
+            try:
+                # For attention weights, handle common cases
+                if small_weight.shape[0] == large_weight.shape[0] and small_weight.shape[1] != large_weight.shape[1]:
+                    # Same output dim, different input dim (common for attention)
+                    min_dim1 = min(small_weight.shape[1], large_weight.shape[1])
+                    large_slice = large_weight[:, :min_dim1]
+                    small_slice = small_weight[:, :min_dim1]
+                    delta = torch.zeros_like(small_weight)
+                    delta[:, :min_dim1] = large_slice - small_slice
+                elif small_weight.shape[1] == large_weight.shape[1] and small_weight.shape[0] != large_weight.shape[0]:
+                    # Same input dim, different output dim
+                    min_dim0 = min(small_weight.shape[0], large_weight.shape[0])
+                    large_slice = large_weight[:min_dim0, :]
+                    small_slice = small_weight[:min_dim0, :]
+                    delta = torch.zeros_like(small_weight)
+                    delta[:min_dim0, :] = large_slice - small_slice
+                elif small_weight.shape[0] <= large_weight.shape[0] and small_weight.shape[1] <= large_weight.shape[1]:
+                    # Small is subset of large - slice both dimensions
+                    large_slice = large_weight[:small_weight.shape[0], :small_weight.shape[1]]
+                    delta = large_slice - small_weight
+                elif small_weight.shape[0] >= large_weight.shape[0] and small_weight.shape[1] >= large_weight.shape[1]:
+                    # Large is subset of small - pad
+                    delta = torch.zeros_like(small_weight)
+                    delta[:large_weight.shape[0], :large_weight.shape[1]] = large_weight - small_weight[:large_weight.shape[0], :large_weight.shape[1]]
+                else:
+                    # Complex mismatch - use simple slicing to smaller dimensions
+                    min_dim0 = min(small_weight.shape[0], large_weight.shape[0])
+                    min_dim1 = min(small_weight.shape[1], large_weight.shape[1])
 
-            delta[:min_dim0, :min_dim1] = large_slice - small_slice
-            return delta.detach().cpu()
+                    large_slice = large_weight[:min_dim0, :min_dim1]
+                    small_slice = small_weight[:min_dim0, :min_dim1]
+                    delta = torch.zeros_like(small_weight)
+                    delta[:min_dim0, :min_dim1] = large_slice - small_slice
+
+                return delta.detach().cpu()
+
+            except Exception as e:
+                logger.debug(f"Failed to compute delta: {e}")
+                return None
 
         # Same shape - direct delta
         delta = large_weight - small_weight
@@ -530,44 +567,38 @@ class VADASMMerger:
         return alignment_maps
     
     def _hungarian_alignment(self, small_acts: torch.Tensor, large_acts: torch.Tensor) -> torch.Tensor:
-        """Find optimal neuron permutation using Hungarian algorithm (cosine similarity)"""
+        """Find optimal feature (neuron) permutation using Hungarian algorithm.
 
-        # Handle dimension mismatch - project to common dimension
-        if small_acts.shape[1] != large_acts.shape[1]:
-            logger.info(f"Aligning dimensions: small={small_acts.shape[1]}, large={large_acts.shape[1]}")
-
-            # Project to smaller dimension to preserve information
-            target_dim = min(small_acts.shape[1], large_acts.shape[1])
-
-            if small_acts.shape[1] > target_dim:
-                # Project small acts down
-                projection = torch.randn(small_acts.shape[1], target_dim).to(small_acts.device)
-                small_acts = small_acts @ projection
-
-            if large_acts.shape[1] > target_dim:
-                # Project large acts down
-                projection = torch.randn(large_acts.shape[1], target_dim).to(large_acts.device)
-                large_acts = large_acts @ projection
-
-        # Ensure we have enough samples for alignment
+        Important: We only apply a permutation when feature dimensions match exactly.
+        This guarantees weight shapes are preserved and prevents accidental resizing.
+        """
+        # Ensure same number of samples
         n_samples = min(small_acts.shape[0], large_acts.shape[0])
         if small_acts.shape[0] != large_acts.shape[0]:
             small_acts = small_acts[:n_samples]
             large_acts = large_acts[:n_samples]
 
-        # Compute cosine similarities between neurons
-        cos_sim = cosine_similarity(small_acts.cpu().numpy(), large_acts.cpu().numpy())
+        # If feature dims differ, skip alignment for this layer (safe fallback)
+        if small_acts.shape[1] != large_acts.shape[1]:
+            logger.info(f"Aligning dimensions: small={small_acts.shape[1]}, large={large_acts.shape[1]}")
+            return torch.tensor([], dtype=torch.long, device=self.device)
+
+        # Compare features (columns); transpose to [hidden_dim, n_samples]
+        small_feats = small_acts.T  # [hidden_dim, n_samples]
+        large_feats = large_acts.T  # [hidden_dim, n_samples]
+
+        # Compute cosine similarity between features
+        cos_sim = cosine_similarity(small_feats.cpu().numpy(), large_feats.cpu().numpy())  # [H, H]
 
         # Negative because scipy minimizes
         cost_matrix = -cos_sim
 
-        # Hungarian algorithm
+        # Hungarian assignment over features
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
 
-        # Create permutation tensor
-        perm = torch.zeros(n_samples, dtype=torch.long)
+        # Full-length permutation over feature dimension
+        perm = torch.empty(small_feats.shape[0], dtype=torch.long)
         perm[row_ind] = torch.tensor(col_ind, dtype=torch.long)
-
         return perm.to(self.device)
     
     def _get_layer_activations(self, layer, inputs: torch.Tensor) -> torch.Tensor:
@@ -631,6 +662,9 @@ class VADASMMerger:
         # Get vision deltas from reduced projector
         W_vis = vis_subspaces["projector_reduced"]
 
+        # Cache total layers for scheduling
+        self._num_layers_cached = len(layers)
+
         # For each layer in alignment maps
         for layer_idx, perm in alignment_maps.items():
             if layer_idx >= len(layers):
@@ -646,10 +680,31 @@ class VADASMMerger:
                     device = layer.self_attn.q_proj.weight.device
                     perm = perm.to(device)
 
-                    # Permute attention weights
-                    layer.self_attn.q_proj.weight.data = layer.self_attn.q_proj.weight.data[:, perm]
-                    layer.self_attn.k_proj.weight.data = layer.self_attn.k_proj.weight.data[:, perm]
-                    layer.self_attn.v_proj.weight.data = layer.self_attn.v_proj.weight.data[perm, :]
+                    # Get weight shapes to handle dimension mismatches
+                    q_shape = layer.self_attn.q_proj.weight.data.shape
+                    k_shape = layer.self_attn.k_proj.weight.data.shape
+                    v_shape = layer.self_attn.v_proj.weight.data.shape
+
+                    # Only apply permutation if dimensions are compatible
+                    perm_size = len(perm)
+
+                    # For Q and K projections: permute input dimension ([: , perm]) ONLY if full-length
+                    if q_shape[1] == perm_size:
+                        layer.self_attn.q_proj.weight.data = layer.self_attn.q_proj.weight.data[:, perm]
+                    else:
+                        logger.debug(f"Skipping Q projection perm for layer {layer_idx}: perm size {perm_size} != input dim {q_shape[1]}")
+
+                    if k_shape[1] == perm_size:
+                        layer.self_attn.k_proj.weight.data = layer.self_attn.k_proj.weight.data[:, perm]
+                    else:
+                        logger.debug(f"Skipping K projection perm for layer {layer_idx}: perm size {perm_size} != input dim {k_shape[1]}")
+
+                    # For V projection: permute output dimension ([perm, :]) ONLY if full-length
+                    if v_shape[0] == perm_size:
+                        layer.self_attn.v_proj.weight.data = layer.self_attn.v_proj.weight.data[perm, :]
+                    else:
+                        logger.debug(f"Skipping V projection perm for layer {layer_idx}: perm size {perm_size} != output dim {v_shape[0]}")
+
                 except Exception as e:
                     logger.warning(f"Could not permute layer {layer_idx}: {e}")
 
@@ -666,7 +721,7 @@ class VADASMMerger:
 
                 # Apply each parameter delta using TIES+DARE
                 for param_path, delta in layer_deltas.items():
-                    self._apply_language_delta(layer, param_path, delta)
+                    self._apply_language_delta(layer, param_path, delta, layer_idx)
                     num_lang_injections += 1
 
         logger.info(f"✓ Applied {num_lang_injections} language knowledge deltas across {len(lang_deltas)} layers")
@@ -676,34 +731,62 @@ class VADASMMerger:
 
         return model
     
-    def _compute_quantile_safe(self, tensor: torch.Tensor, q: float, max_elements: int = 10_000_000):
+    def _compute_quantile_safe(self, tensor: torch.Tensor, q: float, max_elements: int = 50_000_000):
         """
         Safely compute quantile, sampling if tensor is too large
-        
+
         Args:
             tensor: Input tensor (should be 1D or will be flattened)
             q: Quantile to compute (0.0 to 1.0)
             max_elements: Maximum elements before sampling
-            
+
         Returns:
             Quantile value
         """
         flat_tensor = tensor.flatten()
         n_elements = flat_tensor.numel()
-        
+
         if n_elements == 0:
             return torch.tensor(0.0, device=tensor.device, dtype=tensor.dtype)
-        
+
         if n_elements <= max_elements:
             # Small enough, compute directly
             return torch.quantile(flat_tensor, q)
         else:
-            # Too large, sample uniformly
-            logger.info(f"Tensor too large ({n_elements:,} elements), sampling {max_elements:,} for quantile")
-            sample_size = max_elements
+            # Too large, sample uniformly (only log for very large tensors)
+            if n_elements > 100_000_000:  # Only log for extremely large tensors
+                logger.info(f"Tensor too large ({n_elements:,} elements), sampling {max_elements:,} for quantile")
+            sample_size = min(max_elements, n_elements // 10)  # Sample at most 10% of elements
             indices = torch.randperm(n_elements, device='cpu')[:sample_size]
             sampled = flat_tensor.cpu()[indices]
             return torch.quantile(sampled, q).to(tensor.device)
+    
+    def _rescale_delta_to_target(self, target_weights: torch.Tensor, delta: torch.Tensor, max_ratio: float = 0.5) -> torch.Tensor:
+        """
+        Scale delta so its RMS does not exceed max_ratio * RMS(target_weights).
+        Prevents overwhelming the base model and helps preserve behavior.
+        """
+        with torch.no_grad():
+            # Use float32 for stable statistics
+            tw = target_weights.float()
+            dl = delta.float()
+            target_std = tw.std().clamp(min=1e-8)
+            delta_std = dl.std().clamp(min=1e-8)
+            allowed = max_ratio * target_std
+            scale = torch.minimum(allowed / delta_std, torch.tensor(1.0, device=delta.device))
+            return (delta * scale.to(delta.dtype))
+    
+    def _compute_layer_beta(self, layer_idx: int, total_layers: int, base_beta: float) -> float:
+        """
+        Depth-aware beta schedule that protects first/last layers.
+        Parabolic schedule peaked in the middle: coeff in [0.5, 1.0].
+        """
+        if total_layers <= 1:
+            return base_beta
+        x = layer_idx / (total_layers - 1 + 1e-8)  # [0,1]
+        # Parabola with min 0.5 at edges and 1.0 at center
+        coeff = 1.0 - 0.5 * (2 * x - 1.0) ** 2  # in (0.5, 1.0]
+        return float(base_beta * coeff)
     
     def _ties_dare_fusion(self, layer, W_vis: torch.Tensor, layer_idx: int):
         """Apply TIES (resolve conflicts) and DARE (add sparsity) to fusion"""
@@ -739,9 +822,8 @@ class VADASMMerger:
             # Slice W_vis if it's larger
             W_vis = W_vis[:target_weights.shape[0], :target_weights.shape[1]]
 
-        # Compute vision delta (simplified projection)
-        beta = self.config.fusion_beta
-        vis_delta = beta * (W_vis - target_weights)
+        # Compute vision delta (simplified projection) - without beta yet
+        vis_delta = (W_vis - target_weights)
 
         # TIES: Resolve sign conflicts by keeping larger magnitude
         current_sign = torch.sign(target_weights)
@@ -759,10 +841,17 @@ class VADASMMerger:
         final_delta = torch.where(drop_mask, torch.zeros_like(final_delta),
                                 final_delta * self.config.dare_rescale_factor)
 
-        # Apply fusion
-        target_weights.add_(final_delta)
+        # Norm-aware rescaling to avoid overpowering small model weights
+        final_delta = self._rescale_delta_to_target(target_weights, final_delta, max_ratio=0.5)
 
-    def _apply_language_delta(self, layer, param_path: str, delta: torch.Tensor):
+        # Depth-aware beta schedule (protect first/last layers)
+        total_layers = getattr(self, "_num_layers_cached", 1)
+        layer_beta = self._compute_layer_beta(layer_idx, total_layers, self.config.fusion_beta)
+
+        # Apply fusion
+        target_weights.add_(layer_beta * final_delta)
+
+    def _apply_language_delta(self, layer, param_path: str, delta: torch.Tensor, layer_idx: int):
         """
         Apply language knowledge delta to layer parameter using TIES+DARE
 
@@ -798,7 +887,7 @@ class VADASMMerger:
 
         # Ensure shapes match (should already be aligned from _compute_weight_delta)
         if delta.shape != target_weights.shape:
-            logger.warning(f"Shape mismatch for {param_path}: delta={delta.shape}, target={target_weights.shape}")
+            logger.debug(f"Shape mismatch for {param_path}: delta={delta.shape}, target={target_weights.shape}")
             return
 
         # Apply TIES: Resolve sign conflicts
@@ -835,9 +924,21 @@ class VADASMMerger:
         else:
             final_delta = torch.zeros_like(ties_delta)
 
-        # Apply language knowledge delta with scaling
-        # Use language_transfer_beta to control how much large model knowledge to incorporate
-        scaled_delta = self.config.language_transfer_beta * final_delta
+        # Norm-aware rescaling to avoid overpowering small model weights
+        final_delta = self._rescale_delta_to_target(target_weights, final_delta, max_ratio=0.5)
+
+        # Depth-aware beta schedule
+        total_layers = getattr(self, "_num_layers_cached", 1)
+        layer_beta = self._compute_layer_beta(layer_idx, total_layers, self.config.language_transfer_beta)
+
+        # Extra attenuation for sensitive attention projections
+        attn_scale = 1.0
+        if "self_attn.q_proj" in param_path or "self_attn.k_proj" in param_path:
+            attn_scale = 0.5  # Q/K are stability-critical
+        elif "self_attn.v_proj" in param_path or "self_attn.o_proj" in param_path:
+            attn_scale = 0.8
+
+        scaled_delta = layer_beta * attn_scale * final_delta
         target_weights.add_(scaled_delta)
 
     def _inject_vision_projector(self, model, vis_subspaces: Dict):
