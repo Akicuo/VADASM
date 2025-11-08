@@ -121,7 +121,7 @@ class VADASMMerger:
     
     def _load_model(self, config: ModelConfig) -> nn.Module:
         """Load model with vision components if present"""
-        kwargs = {"torch_dtype": self.config.torch_dtype}
+        kwargs = {"dtype": self.config.torch_dtype}
 
         if config.has_vision:
             # Load multimodal model - use AutoModel for vision models
@@ -183,20 +183,37 @@ class VADASMMerger:
             target_dim = large_config.hidden_dim
             W_proj_red = torch.randn(target_dim, 1024).to(self.config.torch_dtype)
         else:
-            # Extract projector weights - handle Linear or Sequential projectors
+            # Extract projector weights - handle different projector types
+            projector_weights = None
+
             if isinstance(projector, nn.Linear):
                 projector_weights = projector.weight.detach().cpu().float()
             elif isinstance(projector, nn.Sequential):
-                # Get first linear layer
+                # Get first linear layer from Sequential
                 for layer in projector:
                     if isinstance(layer, nn.Linear):
                         projector_weights = layer.weight.detach().cpu().float()
                         break
+            elif hasattr(projector, 'linear_1'):
+                # LlavaMultiModalProjector has linear_1, linear_2
+                projector_weights = projector.linear_1.weight.detach().cpu().float()
+                logger.info("Using LlavaMultiModalProjector.linear_1")
+            elif hasattr(projector, 'layers') and len(projector.layers) > 0:
+                # Some projectors have a 'layers' attribute
+                first_layer = projector.layers[0]
+                if isinstance(first_layer, nn.Linear):
+                    projector_weights = first_layer.weight.detach().cpu().float()
             else:
-                logger.warning(f"Unknown projector type: {type(projector)}, using placeholder")
+                # Try to iterate through children
+                for child in projector.children():
+                    if isinstance(child, nn.Linear):
+                        projector_weights = child.weight.detach().cpu().float()
+                        break
+
+            if projector_weights is None:
+                logger.warning(f"Could not extract weights from projector type: {type(projector)}, using placeholder")
                 target_dim = large_config.hidden_dim
                 W_proj_red = torch.randn(target_dim, 1024).to(self.config.torch_dtype)
-                projector_weights = None
 
             if projector_weights is not None:
                 # SVD decomposition to extract principal components
@@ -297,25 +314,62 @@ class VADASMMerger:
     
     def _hungarian_alignment(self, small_acts: torch.Tensor, large_acts: torch.Tensor) -> torch.Tensor:
         """Find optimal neuron permutation using Hungarian algorithm (cosine similarity)"""
+
+        # Handle dimension mismatch - project to common dimension
+        if small_acts.shape[1] != large_acts.shape[1]:
+            logger.info(f"Aligning dimensions: small={small_acts.shape[1]}, large={large_acts.shape[1]}")
+
+            # Project to smaller dimension to preserve information
+            target_dim = min(small_acts.shape[1], large_acts.shape[1])
+
+            if small_acts.shape[1] > target_dim:
+                # Project small acts down
+                projection = torch.randn(small_acts.shape[1], target_dim).to(small_acts.device)
+                small_acts = small_acts @ projection
+
+            if large_acts.shape[1] > target_dim:
+                # Project large acts down
+                projection = torch.randn(large_acts.shape[1], target_dim).to(large_acts.device)
+                large_acts = large_acts @ projection
+
+        # Ensure we have enough samples for alignment
+        n_samples = min(small_acts.shape[0], large_acts.shape[0])
+        if small_acts.shape[0] != large_acts.shape[0]:
+            small_acts = small_acts[:n_samples]
+            large_acts = large_acts[:n_samples]
+
         # Compute cosine similarities between neurons
         cos_sim = cosine_similarity(small_acts.cpu().numpy(), large_acts.cpu().numpy())
-        
+
         # Negative because scipy minimizes
         cost_matrix = -cos_sim
-        
+
         # Hungarian algorithm
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
-        
+
         # Create permutation tensor
-        perm = torch.zeros(small_acts.shape[0], dtype=torch.long)
+        perm = torch.zeros(n_samples, dtype=torch.long)
         perm[row_ind] = torch.tensor(col_ind, dtype=torch.long)
-        
+
         return perm.to(self.device)
     
     def _get_layer_activations(self, layer, inputs: torch.Tensor) -> torch.Tensor:
         """Get activations from a transformer layer"""
+        # Get hidden size from layer config or attributes
+        if hasattr(layer, 'hidden_size'):
+            hidden_size = layer.hidden_size
+        elif hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'hidden_size'):
+            hidden_size = layer.self_attn.hidden_size
+        elif hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'embed_dim'):
+            hidden_size = layer.self_attn.embed_dim
+        elif hasattr(layer, 'self_attn') and hasattr(layer.self_attn.q_proj, 'out_features'):
+            hidden_size = layer.self_attn.q_proj.out_features
+        else:
+            # Fallback to input dimension
+            hidden_size = inputs.shape[-1]
+
         # Simplified - in practice use hooks or attention outputs
-        return torch.randn(inputs.shape[0], layer.hidden_size).to(self.device)
+        return torch.randn(inputs.shape[0], hidden_size).to(self.device)
     
     def _get_layer_activations_moe(self, layer, inputs: torch.Tensor) -> torch.Tensor:
         """Get activations from MoE layer (aggregate over experts)"""
