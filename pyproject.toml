@@ -1,0 +1,1 @@
+[tool:pytest]\ntestpaths = tests\ndoctor_report = true\n\n[tool:ruff]\nline-length = 88\ntarget-version = "py38"\n\n[tool:ruff.lint]\nselect = ["E", "F", "W", "C90"]\nignore = ["E501", "W503"]\n\n[tool:ruff.lint.mccabe]\nmax-complexity = 10
