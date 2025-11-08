@@ -676,6 +676,35 @@ class VADASMMerger:
 
         return model
     
+    def _compute_quantile_safe(self, tensor: torch.Tensor, q: float, max_elements: int = 10_000_000):
+        """
+        Safely compute quantile, sampling if tensor is too large
+        
+        Args:
+            tensor: Input tensor (should be 1D or will be flattened)
+            q: Quantile to compute (0.0 to 1.0)
+            max_elements: Maximum elements before sampling
+            
+        Returns:
+            Quantile value
+        """
+        flat_tensor = tensor.flatten()
+        n_elements = flat_tensor.numel()
+        
+        if n_elements == 0:
+            return torch.tensor(0.0, device=tensor.device, dtype=tensor.dtype)
+        
+        if n_elements <= max_elements:
+            # Small enough, compute directly
+            return torch.quantile(flat_tensor, q)
+        else:
+            # Too large, sample uniformly
+            logger.info(f"Tensor too large ({n_elements:,} elements), sampling {max_elements:,} for quantile")
+            sample_size = max_elements
+            indices = torch.randperm(n_elements, device='cpu')[:sample_size]
+            sampled = flat_tensor.cpu()[indices]
+            return torch.quantile(sampled, q).to(tensor.device)
+    
     def _ties_dare_fusion(self, layer, W_vis: torch.Tensor, layer_idx: int):
         """Apply TIES (resolve conflicts) and DARE (add sparsity) to fusion"""
 
@@ -725,7 +754,7 @@ class VADASMMerger:
 
         # DARE: Drop small deltas and rescale survivors
         abs_delta = torch.abs(final_delta).float()  # Convert to float for quantile
-        threshold = torch.quantile(abs_delta, self.config.ties_drop_rate)
+        threshold = self._compute_quantile_safe(abs_delta, self.config.ties_drop_rate)
         drop_mask = torch.abs(final_delta) < threshold
         final_delta = torch.where(drop_mask, torch.zeros_like(final_delta),
                                 final_delta * self.config.dare_rescale_factor)
@@ -791,7 +820,7 @@ class VADASMMerger:
         # This prevents catastrophic forgetting by only keeping significant changes
         abs_delta = torch.abs(ties_delta).float()
         if abs_delta.numel() > 0 and abs_delta.max() > 0:
-            threshold = torch.quantile(abs_delta, self.config.ties_drop_rate)
+            threshold = self._compute_quantile_safe(abs_delta, self.config.ties_drop_rate)
             dare_mask = torch.abs(ties_delta) > threshold
 
             # Count kept elements and rescale
