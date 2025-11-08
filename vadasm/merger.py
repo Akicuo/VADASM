@@ -75,15 +75,122 @@ class VADASMMerger:
     V-ADASM merger: Injects vision capabilities from large multimodal donors
     into small text-only models through subspace merging and evolutionary tuning.
     """
-    
+
     def __init__(self, merge_config: MergeConfig):
         self.config = merge_config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if merge_config.device != "auto":
             self.device = torch.device(merge_config.device)
-            
+
         logger.info(f"Initialized V-ADASM merger on device: {self.device}")
+
+    def _fix_model_config(self, model):
+        """
+        Ensure model has a proper PretrainedConfig object instead of a dict.
+        This fixes save_pretrained() issues with models loaded with trust_remote_code=True.
+        """
+        from transformers import PretrainedConfig
+
+        if isinstance(model.config, dict) or not hasattr(model.config, 'to_dict'):
+            logger.info("Fixing model config: converting dict to PretrainedConfig...")
+            try:
+                # Get original config dict
+                orig_config_dict = model.config if isinstance(model.config, dict) else {}
+
+                # Create a proper config object
+                new_config = PretrainedConfig()
+
+                # Copy over important attributes from original config
+                for key, value in orig_config_dict.items():
+                    try:
+                        setattr(new_config, key, value)
+                    except:
+                        pass
+
+                # Replace the dict config with proper PretrainedConfig
+                model.config = new_config
+                logger.info("✓ Fixed model config to PretrainedConfig")
+
+            except Exception as e:
+                logger.warning(f"Could not fix model config: {e}")
+                # Continue anyway - the notebook save logic will handle it
+        else:
+            logger.debug("Model config already proper")
     
+    def _validate_model_compatibility(self, small_config: ModelConfig, large_config: ModelConfig) -> bool:
+        """
+        Validate that models are compatible for V-ADASM merging.
+
+        V-ADASM can merge ANY incompatible models:
+        - Text + Text (language knowledge transfer)
+        - Text + Vision (add vision capabilities)
+        - Vision + Vision (merge different multimodal models)
+        - Vision + Text (add language capabilities)
+        """
+        logger.info("Validating model compatibility for V-ADASM...")
+
+        # Determine merge type based on vision capabilities
+        small_vision = small_config.has_vision
+        large_vision = large_config.has_vision
+
+        if not small_vision and not large_vision:
+            logger.info("🔤 Text-only merge: Both models are text-only")
+            logger.info("   This will transfer language knowledge from large to small model")
+        elif not small_vision and large_vision:
+            logger.info("👁️  Vision addition: Small text model + Large vision model")
+            logger.info("   This will add vision capabilities to the small model")
+        elif small_vision and not large_vision:
+            logger.info("📚 Language enhancement: Small vision model + Large text model")
+            logger.info("   This will enhance language capabilities of the vision model")
+        elif small_vision and large_vision:
+            logger.info("🔄 Multimodal merge: Both models have vision capabilities")
+            logger.info("   This will merge different multimodal architectures")
+
+        # Check architecture families (just warnings, not blocking)
+        small_arch = small_config.name_or_path.lower()
+        large_arch = large_config.name_or_path.lower()
+
+        # Compatible architecture families
+        text_archs = ['gpt2', 'gpt_neo', 'gpt_neox', 'gptj', 'llama', 'mistral', 'phi', 'qwen', 'qwen2', 'opt', 'bloom']
+        vision_archs = ['llava', 'qwen-vl', 'qwen2-vl', 'mini-cpm', 'cogvlm', 'pali', 'blip']
+
+        small_compatible = any(arch in small_arch for arch in text_archs + vision_archs)
+        large_compatible = any(arch in large_arch for arch in text_archs + vision_archs)
+
+        if not small_compatible:
+            logger.warning(f"⚠️  Small model architecture may have limited compatibility: {small_config.name_or_path}")
+            logger.info("   V-ADASM works best with: GPT-2, LLaMA, Mistral, Phi, Qwen, OPT, Bloom, LLaVA families")
+
+        if not large_compatible:
+            logger.warning(f"⚠️  Large model architecture may have limited compatibility: {large_config.name_or_path}")
+            logger.info("   V-ADASM works best with: GPT-2, LLaMA, Mistral, Phi, Qwen, OPT, Bloom, LLaVA families")
+
+        # Check parameter ratios (large should generally be larger, but not strictly required)
+        if small_config.num_layers > large_config.num_layers:
+            logger.warning(f"⚠️  Small model has more layers ({small_config.num_layers}) than large model ({large_config.num_layers})")
+            logger.info("   Usually large model should be bigger, but proceeding anyway...")
+
+        if small_config.hidden_dim > large_config.hidden_dim:
+            logger.warning(f"⚠️  Small model has larger hidden dim ({small_config.hidden_dim}) than large model ({large_config.hidden_dim})")
+            logger.info("   Usually large model should have larger dimensions, but proceeding anyway...")
+
+        # Estimate parameter counts (rough guidance only)
+        small_params = small_config.num_layers * small_config.hidden_dim * small_config.hidden_dim * 12  # Rough estimate
+        large_params = large_config.num_layers * large_config.hidden_dim * large_config.hidden_dim * 12
+
+        ratio = large_params / max(small_params, 1)
+        if ratio < 2:
+            logger.warning(f"⚠️  Parameter ratio very small ({ratio:.1f}x)")
+            logger.info("   Large model should ideally be bigger for better knowledge transfer")
+        elif ratio > 100:
+            logger.warning(f"⚠️  Parameter ratio very large ({ratio:.1f}x)")
+            logger.info("   Very large ratios may cause training instability")
+
+        logger.info("✅ Model compatibility validation completed - proceeding with merge")
+        logger.info(f"   Small: {small_config.name_or_path} ({small_config.num_layers}L × {small_config.hidden_dim}D)")
+        logger.info(f"   Large: {large_config.name_or_path} ({large_config.num_layers}L × {large_config.hidden_dim}D)")
+        return True
+
     def merge_models(self, small_config: ModelConfig, large_config: ModelConfig,
                     val_data: Optional[Dict] = None) -> nn.Module:
         """
@@ -99,9 +206,18 @@ class VADASMMerger:
         """
         logger.info("Starting Enhanced V-ADASM merge pipeline (vision + language knowledge)...")
 
+        # Validate compatibility before proceeding
+        self._validate_model_compatibility(small_config, large_config)
+
         # Load models
         small_model = self._load_model(small_config)
         large_model = self._load_model(large_config)
+
+        # Fix configs for all loaded models to ensure save_pretrained() works
+        if "model" in small_model:
+            self._fix_model_config(small_model["model"])
+        if "model" in large_model:
+            self._fix_model_config(large_model["model"])
 
         # Step 1: Extract vision subspaces from donor
         vis_subspaces, cross_acts = self._extract_vision_subspaces(large_model, large_config)
@@ -114,7 +230,10 @@ class VADASMMerger:
                                                   small_config, large_config, cross_acts)
 
         # Step 4: Fuse both vision subspaces AND language knowledge into small model
-        merged_model = self._subspace_fusion_injection(small_model, vis_subspaces, align_maps, lang_deltas)
+        merged_model = self._subspace_fusion_injection(small_model, vis_subspaces, align_maps, lang_deltas, small_config, large_config)
+
+        # Ensure merged model has proper config
+        self._fix_model_config(merged_model)
 
         # Step 5: Evolutionary hyperparameter optimization
         if val_data:
@@ -632,14 +751,14 @@ class VADASMMerger:
         return torch.stack(expert_outputs, dim=0).mean(dim=0)
     
     def _subspace_fusion_injection(self, small_model, vis_subspaces: Dict,
-                                 alignment_maps: Dict, lang_deltas: Dict) -> nn.Module:
+                                 alignment_maps: Dict, lang_deltas: Dict,
+                                 small_config: ModelConfig, large_config: ModelConfig) -> nn.Module:
         """
-        Step 4: Inject both vision subspaces AND language knowledge into small model using TIES and DARE
+        Step 4: Inject vision subspaces AND/OR language knowledge into small model using TIES and DARE
 
-        This method now does:
-        1. Applies permutations from alignment
-        2. Injects vision capabilities via TIES+DARE fusion
-        3. Transfers language knowledge from large model via TIES+DARE on deltas
+        Conditionally injects based on model capabilities:
+        - If large model has vision: injects vision capabilities
+        - Always transfers language knowledge from large model
         """
         logger.info("Step 4: Subspace fusion and injection (vision + language)...")
 
@@ -655,8 +774,11 @@ class VADASMMerger:
             layers = model.transformer.h
         else:
             logger.warning("Could not find model layers, skipping fusion")
-            # Still inject vision projector
-            self._inject_vision_projector(model, vis_subspaces)
+            # Conditionally inject vision projector if large model has vision
+            if large_config.has_vision:
+                self._inject_vision_projector(model, vis_subspaces)
+            else:
+                logger.info("Skipping vision injection (large model has no vision)")
             return model
 
         # Get vision deltas from reduced projector
@@ -726,8 +848,12 @@ class VADASMMerger:
 
         logger.info(f"✓ Applied {num_lang_injections} language knowledge deltas across {len(lang_deltas)} layers")
 
-        # Inject vision projector as prefix for multimodal inference
-        self._inject_vision_projector(model, vis_subspaces)
+        # Conditionally inject vision projector if large model has vision capabilities
+        if large_config.has_vision:
+            logger.info("Injecting vision projector for multimodal inference")
+            self._inject_vision_projector(model, vis_subspaces)
+        else:
+            logger.info("Skipping vision projector injection (large model has no vision capabilities)")
 
         return model
     
