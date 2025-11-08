@@ -953,7 +953,39 @@ class VADASMMerger:
         # Add as attribute for inference
         model.vision_projector = projector
         
-        # Add vision config
+        # Fix config if it's a dict (from trust_remote_code models)
+        # This ensures save_pretrained() works correctly
+        from transformers import PretrainedConfig, AutoConfig
+        
+        if isinstance(model.config, dict) or not hasattr(model.config, 'to_dict'):
+            logger.info("Config is dict-based (trust_remote_code), converting to PretrainedConfig...")
+            try:
+                # Get original config dict
+                orig_config_dict = model.config if isinstance(model.config, dict) else {}
+                
+                # Create a proper config object
+                # Try to use the model's architecture if available
+                model_type = orig_config_dict.get('model_type', 'auto')
+                
+                # Create a base config with essential attributes
+                new_config = PretrainedConfig()
+                
+                # Copy over important attributes from original config
+                for key, value in orig_config_dict.items():
+                    try:
+                        setattr(new_config, key, value)
+                    except:
+                        pass
+                
+                # Replace the dict config with proper PretrainedConfig
+                model.config = new_config
+                logger.info("✓ Converted config to PretrainedConfig")
+                
+            except Exception as e:
+                logger.warning(f"Could not convert config to PretrainedConfig: {e}")
+                # Continue anyway - the notebook save logic will handle it
+        
+        # Add vision config attributes
         model.config.has_vision = True
         model.config.vision_config = {
             "projector_dim": W_proj.shape[1],
