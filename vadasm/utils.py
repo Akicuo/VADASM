@@ -47,18 +47,18 @@ def ties_merge(deltas: torch.Tensor, drop_rate: float = 0.3, rescale_factor: flo
 def dare_merge(deltas: torch.Tensor, drop_rate: float = 0.3):
     """
     DARE (Drop And REscale) sparsification.
-    
+
     Args:
-        deltas: Parameter deltas to sparsify 
+        deltas: Parameter deltas to sparsify
         drop_rate: Fraction to drop (keep (1-drop_rate) survivors)
-    
+
     Returns:
         Sparsified deltas
     """
     # Drop smallest magnitude deltas
-    abs_deltas = torch.abs(deltas)
+    abs_deltas = torch.abs(deltas).float()  # Convert to float for quantile
     threshold = torch.quantile(abs_deltas, drop_rate)
-    keep_mask = abs_deltas > threshold
+    keep_mask = torch.abs(deltas) > threshold
     
     # Rescale survivors
     num_kept = keep_mask.sum()

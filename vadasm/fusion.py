@@ -101,9 +101,9 @@ class SubspaceFuser:
         ties_delta = torch.where(keep_mask, delta, torch.zeros_like(delta))
         
         # DARE: Drop small magnitudes and rescale survivors
-        abs_ties = torch.abs(ties_delta)
+        abs_ties = torch.abs(ties_delta).float()  # Convert to float for quantile
         threshold = torch.quantile(abs_ties, self.ties_drop_rate)
-        dare_mask = abs_ties > threshold
+        dare_mask = torch.abs(ties_delta) > threshold
         
         # Rescale to preserve total magnitude
         kept_elements = dare_mask.sum()

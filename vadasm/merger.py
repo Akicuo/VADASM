@@ -420,6 +420,10 @@ class VADASMMerger:
             # Apply permutation to align representations (if perm is valid)
             if hasattr(layer, 'self_attn') and len(perm) > 0:
                 try:
+                    # Ensure perm is on the same device as the weights
+                    device = layer.self_attn.q_proj.weight.device
+                    perm = perm.to(device)
+
                     # Permute attention weights
                     layer.self_attn.q_proj.weight.data = layer.self_attn.q_proj.weight.data[:, perm]
                     layer.self_attn.k_proj.weight.data = layer.self_attn.k_proj.weight.data[:, perm]
@@ -483,7 +487,9 @@ class VADASMMerger:
         final_delta = torch.where(ties_mask, vis_delta, torch.zeros_like(vis_delta))
 
         # DARE: Drop small deltas and rescale survivors
-        drop_mask = torch.abs(final_delta) < torch.quantile(torch.abs(final_delta), self.config.ties_drop_rate)
+        abs_delta = torch.abs(final_delta).float()  # Convert to float for quantile
+        threshold = torch.quantile(abs_delta, self.config.ties_drop_rate)
+        drop_mask = torch.abs(final_delta) < threshold
         final_delta = torch.where(drop_mask, torch.zeros_like(final_delta),
                                 final_delta * self.config.dare_rescale_factor)
 
