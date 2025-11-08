@@ -170,3 +170,30 @@ Additional for GPU: `torch` with CUDA support (see `requirements-gpu.txt`)
 - `scripts/eval_vlm.py`: Evaluation CLI with task configs for VQAv2, OK-VQA, MMLU, GSM8K, etc.
 - `examples/`: Jupyter notebooks for interactive demos (`vadasm_quickstart.ipynb`)
 - `docs/`: Additional documentation (benchmarks.md, api.md)
+
+## HuggingFace Hub Integration
+
+The quickstart notebook includes a complete section for uploading merged models to HuggingFace Hub:
+
+### Upload Process
+1. **Authentication**: Uses `notebook_login()` or `HF_TOKEN` environment variable
+2. **Repository Creation**: Automatically creates repo with `create_repo()`
+3. **Model Card Generation**: Creates detailed README.md with model info, usage examples, and citations
+4. **Upload**: Uses `upload_folder()` to push entire model directory
+
+### Two Upload Methods
+- **Recommended**: `upload_folder()` - Uploads entire directory with model card and configs
+- **Alternative**: `model.push_to_hub()` - Direct method for simpler uploads
+
+### Model Card Template
+The notebook automatically generates a comprehensive model card including:
+- Model architecture details (parameters, size, vision capability)
+- Base and donor model references
+- V-ADASM merge process explanation
+- Usage code examples
+- Performance metrics
+- Citation information
+
+### Authentication Requirements
+- HuggingFace account with write access token from https://huggingface.co/settings/tokens
+- Token can be provided via notebook widget or `HF_TOKEN` environment variable

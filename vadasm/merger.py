@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 from typing import Dict, List, Optional, Tuple, Union, Any
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoProcessor
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoProcessor, AutoModel
 from dataclasses import dataclass
 import logging
 from sklearn.metrics.pairwise import cosine_similarity
@@ -122,14 +122,25 @@ class VADASMMerger:
     def _load_model(self, config: ModelConfig) -> nn.Module:
         """Load model with vision components if present"""
         kwargs = {"torch_dtype": self.config.torch_dtype}
-        
+
         if config.has_vision:
-            # Load multimodal model
-            model = AutoModelForCausalLM.from_pretrained(
-                config.name_or_path, **kwargs
-            )
-            processor = AutoProcessor.from_pretrained(config.name_or_path)
-            return {"model": model, "processor": processor}
+            # Load multimodal model - use AutoModel for vision models
+            try:
+                from transformers import LlavaForConditionalGeneration, AutoProcessor
+                logger.info(f"Loading multimodal model: {config.name_or_path}")
+                model = LlavaForConditionalGeneration.from_pretrained(
+                    config.name_or_path, **kwargs
+                )
+                processor = AutoProcessor.from_pretrained(config.name_or_path)
+                return {"model": model, "processor": processor}
+            except Exception as e:
+                logger.warning(f"Failed to load as LLaVA, trying AutoModel: {e}")
+                from transformers import AutoModel
+                model = AutoModel.from_pretrained(
+                    config.name_or_path, trust_remote_code=True, **kwargs
+                )
+                processor = AutoProcessor.from_pretrained(config.name_or_path)
+                return {"model": model, "processor": processor}
         else:
             # Load text-only model
             model = AutoModelForCausalLM.from_pretrained(
@@ -141,86 +152,147 @@ class VADASMMerger:
     def _extract_vision_subspaces(self, large_model, large_config: ModelConfig) -> Tuple[Dict, torch.Tensor]:
         """
         Step 1: Extract vision subspaces from large donor model
-        
+
         Returns:
             vis_subspaces: Dict of reduced vision tensors per layer
             cross_acts: Cross-modal activation similarities for alignment
         """
         logger.info("Step 1: Extracting vision subspaces...")
-        
+
         model = large_model["model"]
-        processor = large_model["processor"]
-        
-        # Get vision components
-        vision_tower = model.vision_tower
-        projector = model.multi_modal_projector
-        
-        # Make projector trainable for SVD
-        projector_weights = projector.weight.detach().cpu().float()
-        
-        # SVD decomposition to extract principal components
-        U, s, Vt = torch.svd(projector_weights)
-        
-        # Keep k components capturing 95% variance
-        variance_explained = torch.cumsum(s**2, 0) / torch.sum(s**2)
-        k = torch.where(variance_explained >= self.config.projector_svd_rank)[0][0].item() + 1
-        
-        W_proj_red = U[:, :k] @ torch.diag(s[:k]) @ Vt[:k, :]
-        
-        # Resize to small model's hidden dimension if needed
-        target_dim = large_config.hidden_dim  # Will be aligned later
-        if W_proj_red.shape[0] != target_dim:
-            # Simple projection - in practice use learned alignment
-            W_proj_red = torch.nn.functional.interpolate(W_proj_red.unsqueeze(0), 
-                                                       size=(target_dim, W_proj_red.shape[1]), 
-                                                       mode='bilinear').squeeze(0)
-        
+        processor = large_model.get("processor")
+
+        # Get vision components - handle different architectures
+        vision_tower = None
+        projector = None
+
+        # LLaVA-style models
+        if hasattr(model, 'vision_tower'):
+            vision_tower = model.vision_tower
+        elif hasattr(model, 'model') and hasattr(model.model, 'vision_tower'):
+            vision_tower = model.model.vision_tower
+
+        if hasattr(model, 'multi_modal_projector'):
+            projector = model.multi_modal_projector
+        elif hasattr(model, 'model') and hasattr(model.model, 'multi_modal_projector'):
+            projector = model.model.multi_modal_projector
+
+        if projector is None:
+            logger.warning("No vision projector found, using placeholder")
+            # Create a dummy projector for demonstration
+            target_dim = large_config.hidden_dim
+            W_proj_red = torch.randn(target_dim, 1024).to(self.config.torch_dtype)
+        else:
+            # Extract projector weights - handle Linear or Sequential projectors
+            if isinstance(projector, nn.Linear):
+                projector_weights = projector.weight.detach().cpu().float()
+            elif isinstance(projector, nn.Sequential):
+                # Get first linear layer
+                for layer in projector:
+                    if isinstance(layer, nn.Linear):
+                        projector_weights = layer.weight.detach().cpu().float()
+                        break
+            else:
+                logger.warning(f"Unknown projector type: {type(projector)}, using placeholder")
+                target_dim = large_config.hidden_dim
+                W_proj_red = torch.randn(target_dim, 1024).to(self.config.torch_dtype)
+                projector_weights = None
+
+            if projector_weights is not None:
+                # SVD decomposition to extract principal components
+                U, s, Vt = torch.svd(projector_weights)
+
+                # Keep k components capturing 95% variance
+                variance_explained = torch.cumsum(s**2, 0) / torch.sum(s**2)
+                k = torch.where(variance_explained >= self.config.projector_svd_rank)[0][0].item() + 1
+
+                W_proj_red = U[:, :k] @ torch.diag(s[:k]) @ Vt[:k, :]
+
+                # Resize to target dimension if needed
+                target_dim = large_config.hidden_dim
+                if W_proj_red.shape[0] != target_dim:
+                    # Simple linear interpolation
+                    scale = target_dim / W_proj_red.shape[0]
+                    W_proj_red = torch.nn.functional.interpolate(
+                        W_proj_red.unsqueeze(0).unsqueeze(0),
+                        size=(target_dim, W_proj_red.shape[1]),
+                        mode='bilinear',
+                        align_corners=False
+                    ).squeeze(0).squeeze(0)
+
         # Generate cross-modal activations (simplified - use dummy data)
         # In practice: forward pass on vision-text pairs
-        cross_acts = torch.randn(1000, target_dim)  # Placeholder
-        
+        cross_acts = torch.randn(1000, large_config.hidden_dim)  # Placeholder
+
         vis_subspaces = {
             "projector_reduced": W_proj_red.to(self.config.torch_dtype),
-            "vision_encoder": vision_tower.state_dict(),
+            "vision_encoder": vision_tower.state_dict() if vision_tower else {},
             "num_layers": large_config.num_layers
         }
-        
+
         return vis_subspaces, cross_acts.to(self.device)
     
-    def _cross_modality_alignment(self, small_model, large_model, small_config: ModelConfig, 
+    def _cross_modality_alignment(self, small_model, large_model, small_config: ModelConfig,
                                 large_config: ModelConfig, cross_acts: torch.Tensor) -> Dict:
         """
         Step 2: Align representations across modalities using neuron permutations
         """
         logger.info("Step 2: Cross-modality alignment...")
-        
+
         small_model = small_model["model"]
         large_model = large_model["model"]
-        
+
+        # Get the language model from LLaVA if needed
+        if hasattr(large_model, 'language_model'):
+            large_model = large_model.language_model
+        elif hasattr(large_model, 'model') and hasattr(large_model.model, 'layers'):
+            large_model = large_model.model
+
         alignment_maps = {}
-        
+
+        # Check if models have layers attribute
+        if not hasattr(small_model, 'layers'):
+            if hasattr(small_model, 'model') and hasattr(small_model.model, 'layers'):
+                small_model = small_model.model
+            elif hasattr(small_model, 'transformer') and hasattr(small_model.transformer, 'h'):
+                # GPT-style models use 'h' instead of 'layers'
+                small_model.layers = small_model.transformer.h
+            else:
+                logger.warning("Could not find layers in small model, skipping alignment")
+                return alignment_maps
+
+        if not hasattr(large_model, 'layers'):
+            logger.warning("Could not find layers in large model, skipping alignment")
+            return alignment_maps
+
         # Align early layers where vision-text crossover happens
-        n_align_layers = int(large_config.num_layers * self.config.alignment_layer_ratio)
-        
+        n_align_layers = min(
+            int(large_config.num_layers * self.config.alignment_layer_ratio),
+            len(small_model.layers),
+            len(large_model.layers)
+        )
+
+        logger.info(f"Aligning {n_align_layers} layers...")
+
         for layer_idx in range(n_align_layers):
             # Get small and large layer representations
             if small_config.is_moe:
                 small_layer = small_model.layers[layer_idx]
                 small_acts = self._get_layer_activations_moe(small_layer, cross_acts)
             else:
-                small_layer = small_model.layers[layer_idx] 
+                small_layer = small_model.layers[layer_idx]
                 small_acts = self._get_layer_activations(small_layer, cross_acts)
-                
+
             if large_config.is_moe:
                 large_layer = large_model.layers[layer_idx]
                 large_acts = self._get_layer_activations_moe(large_layer, cross_acts)
             else:
                 large_layer = large_model.layers[layer_idx]
                 large_acts = self._get_layer_activations(large_layer, cross_acts)
-            
+
             # Hungarian algorithm for optimal permutation
             alignment_maps[layer_idx] = self._hungarian_alignment(small_acts, large_acts)
-        
+
         return alignment_maps
     
     def _hungarian_alignment(self, small_acts: torch.Tensor, large_acts: torch.Tensor) -> torch.Tensor:
