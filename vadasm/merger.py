@@ -116,7 +116,7 @@ class VADASMMerger:
                 # Continue anyway - the notebook save logic will handle it
         else:
             logger.debug("Model config already proper")
-    
+        
     def _validate_model_compatibility(self, small_config: ModelConfig, large_config: ModelConfig) -> bool:
         """
         Validate that models are compatible for V-ADASM merging.
@@ -135,16 +135,16 @@ class VADASMMerger:
 
         if not small_vision and not large_vision:
             logger.info("🔤 Text-only merge: Both models are text-only")
-            logger.info("   This will transfer language knowledge from large to small model")
+            logger.info("   Result: Enhanced language capabilities (no vision)")
         elif not small_vision and large_vision:
             logger.info("👁️  Vision addition: Small text model + Large vision model")
-            logger.info("   This will add vision capabilities to the small model")
+            logger.info("   Result: Small model gains vision capabilities")
         elif small_vision and not large_vision:
             logger.info("📚 Language enhancement: Small vision model + Large text model")
-            logger.info("   This will enhance language capabilities of the vision model")
+            logger.info("   Result: Vision model keeps vision + enhanced language")
         elif small_vision and large_vision:
             logger.info("🔄 Multimodal merge: Both models have vision capabilities")
-            logger.info("   This will merge different multimodal architectures")
+            logger.info("   Result: Merged multimodal model with enhanced capabilities")
 
         # Check architecture families (just warnings, not blocking)
         small_arch = small_config.name_or_path.lower()
@@ -227,7 +227,7 @@ class VADASMMerger:
 
         # Step 3: Align cross-modal representations
         align_maps = self._cross_modality_alignment(small_model, large_model,
-                                                  small_config, large_config, cross_acts)
+                                                small_config, large_config, cross_acts)
 
         # Step 4: Fuse both vision subspaces AND language knowledge into small model
         merged_model = self._subspace_fusion_injection(small_model, vis_subspaces, align_maps, lang_deltas, small_config, large_config)
@@ -244,7 +244,7 @@ class VADASMMerger:
         logger.info(f"Merge completed. Stats: {final_stats}")
 
         return merged_model
-    
+        
     def _load_model(self, config: ModelConfig) -> nn.Module:
         """Load model with vision components if present - supports any model architecture"""
         kwargs = {"dtype": self.config.torch_dtype, "trust_remote_code": True}
@@ -369,7 +369,7 @@ class VADASMMerger:
             except Exception as e:
                 logger.error(f"Failed to load text model: {e}")
                 raise
-    
+        
     def _extract_vision_subspaces(self, large_model, large_config: ModelConfig) -> Tuple[Dict, torch.Tensor]:
         """
         Step 1: Extract vision subspaces from large donor model
@@ -471,7 +471,7 @@ class VADASMMerger:
         return vis_subspaces, cross_acts.to(self.device)
 
     def _extract_language_knowledge(self, small_model, large_model,
-                                   small_config: ModelConfig, large_config: ModelConfig) -> Dict:
+                                small_config: ModelConfig, large_config: ModelConfig) -> Dict:
         """
         Step 2: Extract language knowledge deltas from large model's text capabilities
 
@@ -684,7 +684,7 @@ class VADASMMerger:
             alignment_maps[layer_idx] = self._hungarian_alignment(small_acts, large_acts)
 
         return alignment_maps
-    
+        
     def _hungarian_alignment(self, small_acts: torch.Tensor, large_acts: torch.Tensor) -> torch.Tensor:
         """Find optimal feature (neuron) permutation using Hungarian algorithm.
 
@@ -719,7 +719,7 @@ class VADASMMerger:
         perm = torch.empty(small_feats.shape[0], dtype=torch.long)
         perm[row_ind] = torch.tensor(col_ind, dtype=torch.long)
         return perm.to(self.device)
-    
+        
     def _get_layer_activations(self, layer, inputs: torch.Tensor) -> torch.Tensor:
         """Get activations from a transformer layer"""
         # Get hidden size from layer config or attributes
@@ -737,22 +737,22 @@ class VADASMMerger:
 
         # Simplified - in practice use hooks or attention outputs
         return torch.randn(inputs.shape[0], hidden_size).to(self.device)
-    
+        
     def _get_layer_activations_moe(self, layer, inputs: torch.Tensor) -> torch.Tensor:
         """Get activations from MoE layer (aggregate over experts)"""
         # Aggregate across top-k experts based on router
         expert_outputs = []
-        
+            
         for expert_idx in range(len(layer.experts)):
             expert_output = self._get_layer_activations(layer.experts[expert_idx], inputs)
             expert_outputs.append(expert_output)
-        
+            
         # Simple average - in practice weight by router probabilities  
         return torch.stack(expert_outputs, dim=0).mean(dim=0)
-    
+        
     def _subspace_fusion_injection(self, small_model, vis_subspaces: Dict,
-                                 alignment_maps: Dict, lang_deltas: Dict,
-                                 small_config: ModelConfig, large_config: ModelConfig) -> nn.Module:
+                                alignment_maps: Dict, lang_deltas: Dict,
+                                small_config: ModelConfig, large_config: ModelConfig) -> nn.Module:
         """
         Step 4: Inject vision subspaces AND/OR language knowledge into small model using TIES and DARE
 
@@ -774,11 +774,14 @@ class VADASMMerger:
             layers = model.transformer.h
         else:
             logger.warning("Could not find model layers, skipping fusion")
-            # Conditionally inject vision projector if large model has vision
+            # Handle vision capabilities even when layer finding fails
             if large_config.has_vision:
                 self._inject_vision_projector(model, vis_subspaces)
+            elif small_config.has_vision:
+                logger.info("Preserving vision capabilities from small model")
+                model.config.has_vision = True
             else:
-                logger.info("Skipping vision injection (large model has no vision)")
+                logger.info("No vision capabilities in either model")
             return model
 
         # Get vision deltas from reduced projector
@@ -848,15 +851,19 @@ class VADASMMerger:
 
         logger.info(f"✓ Applied {num_lang_injections} language knowledge deltas across {len(lang_deltas)} layers")
 
-        # Conditionally inject vision projector if large model has vision capabilities
+        # Handle vision capabilities based on both models
         if large_config.has_vision:
             logger.info("Injecting vision projector for multimodal inference")
             self._inject_vision_projector(model, vis_subspaces)
+        elif small_config.has_vision:
+            logger.info("Preserving vision capabilities from small model")
+            # Ensure vision config is preserved from small model
+            model.config.has_vision = True
         else:
-            logger.info("Skipping vision projector injection (large model has no vision capabilities)")
+            logger.info("No vision capabilities in either model")
 
         return model
-    
+        
     def _compute_quantile_safe(self, tensor: torch.Tensor, q: float, max_elements: int = 50_000_000):
         """
         Safely compute quantile, sampling if tensor is too large
@@ -886,7 +893,7 @@ class VADASMMerger:
             indices = torch.randperm(n_elements, device='cpu')[:sample_size]
             sampled = flat_tensor.cpu()[indices]
             return torch.quantile(sampled, q).to(tensor.device)
-    
+        
     def _rescale_delta_to_target(self, target_weights: torch.Tensor, delta: torch.Tensor, max_ratio: float = 0.5) -> torch.Tensor:
         """
         Scale delta so its RMS does not exceed max_ratio * RMS(target_weights).
@@ -901,7 +908,7 @@ class VADASMMerger:
             allowed = max_ratio * target_std
             scale = torch.minimum(allowed / delta_std, torch.tensor(1.0, device=delta.device))
             return (delta * scale.to(delta.dtype))
-    
+        
     def _compute_layer_beta(self, layer_idx: int, total_layers: int, base_beta: float) -> float:
         """
         Depth-aware beta schedule that protects first/last layers.
@@ -913,7 +920,7 @@ class VADASMMerger:
         # Parabola with min 0.5 at edges and 1.0 at center
         coeff = 1.0 - 0.5 * (2 * x - 1.0) ** 2  # in (0.5, 1.0]
         return float(base_beta * coeff)
-    
+        
     def _ties_dare_fusion(self, layer, W_vis: torch.Tensor, layer_idx: int):
         """Apply TIES (resolve conflicts) and DARE (add sparsity) to fusion"""
 
@@ -1069,97 +1076,97 @@ class VADASMMerger:
 
     def _inject_vision_projector(self, model, vis_subspaces: Dict):
         """Inject vision projector for multimodal inference"""
-        
+            
         W_proj = vis_subspaces["projector_reduced"]
-        
+            
         # Create vision projector module
         projector = nn.Linear(W_proj.shape[1], W_proj.shape[0])
         projector.weight.data = W_proj
-        
+            
         # Add as attribute for inference
         model.vision_projector = projector
-        
+            
         # Fix config if it's a dict (from trust_remote_code models)
         # This ensures save_pretrained() works correctly
         from transformers import PretrainedConfig, AutoConfig
-        
+            
         if isinstance(model.config, dict) or not hasattr(model.config, 'to_dict'):
             logger.info("Config is dict-based (trust_remote_code), converting to PretrainedConfig...")
             try:
                 # Get original config dict
                 orig_config_dict = model.config if isinstance(model.config, dict) else {}
-                
+                    
                 # Create a proper config object
                 # Try to use the model's architecture if available
                 model_type = orig_config_dict.get('model_type', 'auto')
-                
+                    
                 # Create a base config with essential attributes
                 new_config = PretrainedConfig()
-                
+                    
                 # Copy over important attributes from original config
                 for key, value in orig_config_dict.items():
                     try:
                         setattr(new_config, key, value)
                     except:
                         pass
-                
+                    
                 # Replace the dict config with proper PretrainedConfig
                 model.config = new_config
                 logger.info("✓ Converted config to PretrainedConfig")
-                
+                    
             except Exception as e:
                 logger.warning(f"Could not convert config to PretrainedConfig: {e}")
                 # Continue anyway - the notebook save logic will handle it
-        
+            
         # Add vision config attributes
         model.config.has_vision = True
         model.config.vision_config = {
             "projector_dim": W_proj.shape[1],
             "hidden_dim": W_proj.shape[0]
         }
-    
+        
     def _evolutionary_tuning(self, model: nn.Module, val_data: Dict, 
-                           small_config: ModelConfig, large_config: ModelConfig) -> nn.Module:
+                        small_config: ModelConfig, large_config: ModelConfig) -> nn.Module:
         """
         Step 4: Use evolutionary algorithm to optimize fusion hyperparameters
         """
         logger.info("Step 4: Evolutionary hyperparameter optimization...")
-        
+            
         try:
             from deap import base, creator, tools, algorithms
         except ImportError:
             logger.warning("DEAP not installed, skipping evolutionary tuning")
             return model
-        
+            
         # Define fitness function
         def evaluate_individual(individual):
             beta, drop_rate = individual
             # Temporarily modify config
             orig_beta = self.config.fusion_beta
             orig_drop = self.config.ties_drop_rate
-            
+                
             self.config.fusion_beta = beta
             self.config.ties_drop_rate = drop_rate
-            
+                
             # Re-run fusion with new params
             # (Simplified - in practice re-fuse and evaluate)
-            
+                
             # Evaluate on mixed objective
             vision_score = self._evaluate_vision(model, val_data.get("vision", []))
             text_score = self._evaluate_text(model, val_data.get("text", []))
-            
+                
             fitness = 0.2 * vision_score + 0.8 * text_score
-            
+                
             # Restore config
             self.config.fusion_beta = orig_beta
             self.config.ties_drop_rate = orig_drop
-            
+                
             return fitness,
-        
+            
         # DEAP setup
         creator.create("FitnessMax", base.Fitness, weights=(1.0,))
         creator.create("Individual", list, fitness=creator.FitnessMax)
-        
+            
         toolbox = base.Toolbox()
         toolbox.register("attr_beta", np.random.uniform, 0.1, 0.6)
         toolbox.register("attr_drop", np.random.uniform, 0.2, 0.5)
@@ -1170,59 +1177,59 @@ class VADASMMerger:
         toolbox.register("mate", tools.cxBlend, alpha=0.5)
         toolbox.register("mutate", tools.mutGaussian, mu=0, sigma=0.1, indpb=self.config.evo_mutation_rate)
         toolbox.register("select", tools.selTournament, tournsize=3)
-        
+            
         # Run evolution
         pop = toolbox.population(n=self.config.evo_population_size)
         hof = tools.HallOfFame(1)
-        
+            
         stats = tools.Statistics(lambda ind: ind.fitness.values[0])
         stats.register("avg", np.mean)
         stats.register("std", np.std)
         stats.register("min", np.min)
         stats.register("max", np.max)
-        
+            
         pop, log = algorithms.eaSimple(pop, toolbox, cxpb=0.7, mutpb=0.3, 
-                                     ngen=self.config.evo_generations, 
-                                     stats=stats, halloffame=hof, verbose=False)
-        
+                                    ngen=self.config.evo_generations, 
+                                    stats=stats, halloffame=hof, verbose=False)
+            
         # Apply best parameters
         best_beta, best_drop = hof[0]
         self.config.fusion_beta = best_beta
         self.config.ties_drop_rate = best_drop
-        
+            
         logger.info(f"Evolutionary tuning complete. Best params: beta={best_beta:.3f}, drop={best_drop:.3f}")
-        
+            
         # Re-run fusion with optimal params
         # (In practice, would need to save/load weights)
-        
+            
         return model
-    
+            
     def _evaluate_vision(self, model, val_data: List) -> float:
         """Evaluate vision capabilities (placeholder)"""
         return 0.5  # Dummy score
-        
+            
     def _evaluate_text(self, model, val_data: List) -> float:
         """Evaluate text capabilities (placeholder)"""  
         return 0.7  # Dummy score
-    
+        
     def _validate_merge(self, model: nn.Module, val_data: Optional[Dict]) -> Dict:
         """Step 5: Final validation and statistics"""
         logger.info("Step 5: Final validation...")
-        
+            
         # Count parameters
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        
+            
         stats = {
             "total_params": total_params,
             "trainable_params": trainable_params,
             "has_vision": hasattr(model, 'vision_projector'),
             "model_size_mb": total_params * 2 / (1024 * 1024)  # Rough BF16 estimate
         }
-        
+            
         if val_data:
             vision_score = self._evaluate_vision(model, val_data.get("vision", []))
             text_score = self._evaluate_text(model, val_data.get("text", []))
             stats.update({"vision_score": vision_score, "text_score": text_score})
-        
+            
         return stats
