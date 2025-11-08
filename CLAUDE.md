@@ -110,6 +110,29 @@ The architecture handles heterogeneous Dense ↔ MoE merges:
 - **`ties_drop_rate`** (0.3): Fraction of deltas to drop in TIES - controls sparsity
 - **`evo_generations`** (15): Number of evolutionary optimization rounds
 
+## Universal Model Support
+
+V-ADASM supports **any** Hugging Face model architecture through automatic detection:
+
+### Supported Model Types
+
+**Text-Only Models (Small Base)**:
+- LLaMA variants (Llama-2, Llama-3, Llama-4)
+- Qwen family (Qwen, Qwen2, Qwen3)
+- GPT family (GPT-2, GPT-J, GPT-NeoX, GPT-OSS)
+- Mistral, Mixtral, Phi, Gemma, DeepSeek, Yi
+- MoE models (Mixtral, DeepSeek-MoE, Qwen-MoE)
+
+**Multimodal Models (Large Donor)**:
+- LLaVA variants (LLaVA-1.5, LLaVA-Next, LLaVA-NeXT)
+- Qwen-VL family (Qwen-VL, Qwen2-VL)
+- CogVLM, InternVL, MiniCPM-V, and other VLMs
+
+### Model Loading Strategy
+1. For vision models: Tries specific classes (LlavaForConditionalGeneration, Qwen2VLForConditionalGeneration, AutoModelForVision2Seq) then falls back to AutoModel
+2. For text models: Uses AutoModelForCausalLM with trust_remote_code=True
+3. All models loaded with proper dtype and device management
+
 ## Important Implementation Details
 
 ### Weight Loading & Device Management

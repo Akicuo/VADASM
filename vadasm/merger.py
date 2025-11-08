@@ -120,34 +120,62 @@ class VADASMMerger:
         return merged_model
     
     def _load_model(self, config: ModelConfig) -> nn.Module:
-        """Load model with vision components if present"""
-        kwargs = {"dtype": self.config.torch_dtype}
+        """Load model with vision components if present - supports any model architecture"""
+        kwargs = {"dtype": self.config.torch_dtype, "trust_remote_code": True}
+
+        logger.info(f"Loading model: {config.name_or_path}")
 
         if config.has_vision:
-            # Load multimodal model - use AutoModel for vision models
+            # Load multimodal model - try multiple approaches for maximum compatibility
+            model = None
+            processor = None
+
+            # Try 1: Specific multimodal classes
             try:
-                from transformers import LlavaForConditionalGeneration, AutoProcessor
-                logger.info(f"Loading multimodal model: {config.name_or_path}")
-                model = LlavaForConditionalGeneration.from_pretrained(
-                    config.name_or_path, **kwargs
+                from transformers import (
+                    LlavaForConditionalGeneration,
+                    Qwen2VLForConditionalGeneration,
+                    AutoModelForVision2Seq,
+                    AutoProcessor
                 )
-                processor = AutoProcessor.from_pretrained(config.name_or_path)
+
+                # Try known multimodal model classes
+                model_classes = [
+                    LlavaForConditionalGeneration,
+                    Qwen2VLForConditionalGeneration,
+                    AutoModelForVision2Seq,
+                ]
+
+                for model_class in model_classes:
+                    try:
+                        model = model_class.from_pretrained(config.name_or_path, **kwargs)
+                        logger.info(f"Loaded as {model_class.__name__}")
+                        break
+                    except:
+                        continue
+
+                if model is None:
+                    # Try AutoModel as fallback
+                    model = AutoModel.from_pretrained(config.name_or_path, **kwargs)
+                    logger.info("Loaded with AutoModel")
+
+                processor = AutoProcessor.from_pretrained(config.name_or_path, trust_remote_code=True)
                 return {"model": model, "processor": processor}
+
             except Exception as e:
-                logger.warning(f"Failed to load as LLaVA, trying AutoModel: {e}")
-                from transformers import AutoModel
-                model = AutoModel.from_pretrained(
-                    config.name_or_path, trust_remote_code=True, **kwargs
-                )
-                processor = AutoProcessor.from_pretrained(config.name_or_path)
-                return {"model": model, "processor": processor}
+                logger.error(f"Failed to load multimodal model: {e}")
+                raise
+
         else:
-            # Load text-only model
-            model = AutoModelForCausalLM.from_pretrained(
-                config.name_or_path, **kwargs
-            )
-            tokenizer = AutoTokenizer.from_pretrained(config.name_or_path)
-            return {"model": model, "tokenizer": tokenizer}
+            # Load text-only model - supports all causal LM architectures
+            try:
+                model = AutoModelForCausalLM.from_pretrained(config.name_or_path, **kwargs)
+                tokenizer = AutoTokenizer.from_pretrained(config.name_or_path, trust_remote_code=True)
+                logger.info(f"Loaded text-only model: {type(model).__name__}")
+                return {"model": model, "tokenizer": tokenizer}
+            except Exception as e:
+                logger.error(f"Failed to load text model: {e}")
+                raise
     
     def _extract_vision_subspaces(self, large_model, large_config: ModelConfig) -> Tuple[Dict, torch.Tensor]:
         """
