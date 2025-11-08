@@ -4,6 +4,7 @@ Cross-modal alignment for V-ADASM
 
 import torch
 import torch.nn as nn
+from typing import Dict
 from sklearn.metrics.pairwise import cosine_similarity
 from scipy.optimize import linear_sum_assignment
 import numpy as np
