@@ -1,1 +1,99 @@
-[tool:pytest]\ntestpaths = tests\ndoctor_report = true\n\n[tool:ruff]\nline-length = 88\ntarget-version = "py38"\n\n[tool:ruff.lint]\nselect = ["E", "F", "W", "C90"]\nignore = ["E501", "W503"]\n\n[tool:ruff.lint.mccabe]\nmax-complexity = 10
+[build-system]
+requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vadasm"
+version = "0.1.0"
+description = "Vision-Adaptive Dimensionality-Aligned Subspace Merging for training-free multimodal LLM fusion"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Akicuo", email = "noreply@github.com"}
+]
+keywords = ["machine-learning", "deep-learning", "nlp", "computer-vision", "model-merging", "llm", "vlm"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "torch>=2.0.0",
+    "transformers>=4.35.0",
+    "scipy>=1.10.0",
+    "scikit-learn>=1.3.0",
+    "numpy>=1.24.0",
+    "deap>=1.4.0",
+    "datasets>=2.14.0",
+    "accelerate>=0.25.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "torch>=2.0.0",
+    "transformers>=4.35.0",
+    "scipy>=1.10.0",
+    "scikit-learn>=1.3.0",
+    "numpy>=1.24.0",
+    "deap>=1.4.0",
+    "datasets>=2.14.0",
+    "accelerate>=0.25.0",
+    "Pillow>=9.0.0",
+    "requests>=2.28.0",
+    "pytest>=7.0.0",
+    "ruff>=0.1.0",
+]
+
+gpu = [
+    "torch>=2.0.0",
+    "transformers>=4.35.0",
+    "scipy>=1.10.0",
+    "scikit-learn>=1.3.0",
+    "numpy>=1.24.0",
+    "deap>=1.4.0",
+    "datasets>=2.14.0",
+    "accelerate>=0.25.0",
+    "Pillow>=9.0.0",
+    "requests>=2.28.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Akicuo/VADASM"
+Repository = "https://github.com/Akicuo/VADASM"
+Issues = "https://github.com/Akicuo/VADASM/issues"
+
+[project.scripts]
+vmerge = "scripts.vmerge:main"
+eval-vlm = "scripts.eval_vlm:main"
+
+[tool.setuptools]
+packages = ["vadasm"]
+
+[tool.setuptools.package-data]
+vadasm = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py38"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "C90"]
+ignore = ["E501", "W503"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
